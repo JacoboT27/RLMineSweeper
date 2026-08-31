@@ -6,7 +6,9 @@ policy-gradient approach (**PPO**), all on a 9×9 board with 10 mines.
 
 **Headline result:** the DQN variants plateau around a **0.32–0.42** greedy win
 rate; PPO reaches **~0.87**, close to the practical ceiling for pure RL on this
-board (~0.90).
+board (~0.90). A transfer-learning experiment — learning from human
+demonstrations — lifts the best value-based agent from **0.42 to ~0.50** with a
+carefully tuned imitation loss, but does not close the gap to PPO.
 
 ---
 
@@ -29,6 +31,10 @@ board (~0.90).
   - [Gameplay](#gameplay)
   - [Discussion](#discussion)
 - [Transfer Learning](#transfer-learning)
+  - [Motivation](#motivation)
+  - [Method](#method)
+  - [Results](#results-1)
+  - [Discussion](#discussion-1)
 
 ---
 
@@ -315,7 +321,136 @@ Each loads `policies/best_<mode>.pt` and writes
 ---
 ## Transfer Learning
 
+Learning from human demonstrations — can a *human teacher* lift the weak
+value-based agent?
+
+### Motivation
+
+The DQN variants plateau around **0.42** greedy win rate, and inspection shows
+they lose by *misranking* — clicking an uncertain cell over an obviously safe
+one. A human, by contrast, clears the large majority of boards. In the data
+collected for this experiment a human won **84%** of games (see below) — far
+above the 0.42 agent — which is exactly the condition under which learning from
+demonstrations can help: the teacher is much stronger than the student.
+
+The question this section answers is therefore: *do human demonstrations lift a
+weak value-based agent, and under what conditions?*
+
+### Method
+
+**Recording.** `play.py --record` saves each played game as
+`demos/game_XXXXX.npz`, storing the same transition tuple the replay buffer uses
+`(obs, act, rew, next_obs, done, next_mask)` plus a `won` flag. Games are written
+atomically per game, so recording can be stopped and resumed across sessions.
+
 ```bash
-python transfer_learning.py --mode base --init-ckpt policies/best_base.pt --margin 0.1 --margin-lambda 0.3
+python play.py --record          # play; each finished game is saved to demos/
 ```
 
+Data collected for this experiment:
+
+| Games | Wins | Win rate | Transitions | From wins only |
+|---|---|---|---|---|
+| 137 | 115 | **84%** | 2,030 | **1,790** |
+
+**Training.** `transfer_learning.py` combines the demonstrations with ongoing
+self-play. Its two key components:
+
+- **Demo-aware buffer.** The demonstrations live in a *protected partition* that
+  is never evicted, and every minibatch *oversamples* them at a fixed fraction
+  (`--demo-frac`, default 0.25). A small human set (~1,800 transitions) therefore
+  stays influential next to the millions of self-play steps that would otherwise
+  drown it out. Self-play transitions fill a separate ring buffer, so training is
+  a *demo + self-play mixture* — never pure offline, which avoids the value
+  function overfitting the demos and extrapolating wildly off-distribution.
+- **DQfD large-margin loss.** On demonstration transitions, an imitation term
+  pushes `Q(s, a_human)` at least a margin above every other legal action:
+  `J = maxₐ [Q(s, a) + l(a_human, a)] − Q(s, a_human)`, with `l = margin` for
+  `a ≠ a_human` and 0 otherwise. This makes the demos teach *which cell to click*,
+  not merely supply extra data. Its strength is set by `--margin` (the margin `l`)
+  and `--margin-lambda` (its weight); `--margin-lambda 0` disables imitation and
+  treats the demos as plain buffer data.
+
+It works for any `--mode` (the mode selects the network; the demo-aware buffer
+replaces the replay strategy), and can either train from scratch or warm-start an
+existing checkpoint with `--init-ckpt`.
+
+### Results
+
+The imitation loss turned out to be a **delicate knob**, and sweeping it is the
+real result — it characterizes *when* demonstrations help:
+
+| Config | Margin `l` / λ | Start | TD loss | Greedy win rate |
+|---|---|---|---|---|
+| baseline (no demos) | — | — | stable | 0.42 |
+| strong margin, from scratch | 0.8 / 1.0 | scratch | **diverged** (→ ~3) | ~0.25–0.30 |
+| demos as data (imitation off) | — / 0 | warm-start | stable | ~0.42 |
+| **gentle margin** | **0.1 / 0.3** | **warm-start** | stable | **0.50** |
+
+Reading down the table:
+
+- **Strong margin, from scratch — worse.** With rewards in `[−1, +1]`, a margin
+  of 0.8 is enormous relative to the value differences the TD loss is learning, so
+  the imitation term dominated, inflated the Q-values, and the TD loss diverged
+  (climbed steadily instead of settling). Win rate fell *below* base. Imitation
+  overpowered the RL objective.
+- **Demos as plain data — neutral.** Protected + oversampled but with imitation
+  off, the demos held the baseline (~0.42) but did not lift it. This is
+  informative: simply *injecting more wins* into the buffer did not help, which
+  says the bottleneck was not a lack of win-examples but *how the value function
+  ranks actions*.
+- **Gentle margin — helps.** An order-of-magnitude weaker imitation term
+  (`0.1 / 0.3`), warm-started from `best_base.pt`, kept the TD loss stable and
+  lifted the greedy win rate to **0.50 — an 8-point gain over base (0.42)**,
+  measured on the *same* 100-game evaluation.
+
+Training eval: `EVAL ep 23500: win 0.495 | return +1.16 | len 12.7`.
+Independent 100-game evaluation: `greedy win rate 0.500 (avg 12.9 clicks)`.
+
+**Training curves** (win rate, return, ε, TD loss):
+
+![transfer learning training](training_plots/training_base_demo.png)
+
+**Gameplay** of the demo-augmented agent:
+
+![base+demos](visualization/game_base_demo.gif)
+
+### Usage
+
+The configuration that worked (frozen for reproducibility):
+
+```bash
+python transfer_learning.py --mode base \
+    --init-ckpt policies/best_base.pt --margin 0.1 --margin-lambda 0.3
+```
+
+Writes `policies/best_base_demo.pt` (+ `_last.pt`) and
+`training_plots/training_base_demo.png`. Visualize the result with:
+
+```bash
+python visualize.py --mode base --checkpoint policies/best_base_demo.pt \
+    --out visualization/game_base_demo
+```
+
+Other options: `--all-games` (include losses, default is wins-only),
+`--demo-frac` (demo oversampling fraction), and omitting `--init-ckpt` to train
+from scratch.
+
+### Discussion
+
+- **Imitation helped, but only with careful weighting.** The full arc — strong
+  margin *destabilizes*, demos-as-data are *neutral*, gentle margin *helps* — shows
+  the imitation loss must be a *nudge* to the action ranking, not a force that
+  dwarfs the reward signal.
+- **The bottleneck was ranking, not data.** That demos-as-plain-data did not lift
+  the win rate indicates the weak agent was not merely short of winning examples;
+  its value function misranks safe-vs-risky cells, and only a (gentle) imitation
+  term that directly reshapes that ranking moved the number.
+- **Demonstrations refine, they do not break the ceiling.** Even the best
+  demo-augmented value-based agent (0.50) remains far below PPO (0.87).
+  Human demonstrations improve a value-based policy at the margins but do not
+  overcome the representational limit that PPO sidesteps by optimizing the policy
+  directly rather than an argmax over values.
+- **Caveat: single seed.** The 0.42 → 0.50 result is one training run. RL is
+  high-variance run-to-run, so a second seed is needed before stating "+8 points"
+  as a firm finding rather than "helped, ~0.45–0.50."
