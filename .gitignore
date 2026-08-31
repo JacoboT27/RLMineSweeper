@@ -3,3 +3,4 @@ __pycache__
 !policies/*.pt
 policies/*last.pt
 
+demos
